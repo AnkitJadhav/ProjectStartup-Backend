@@ -12,9 +12,17 @@ from werkzeug.utils import secure_filename
 
 # Core libraries
 import PyPDF2
-from sentence_transformers import SentenceTransformer
 import numpy as np
 import requests
+from sklearn.feature_extraction.text import TfidfVectorizer
+from nltk.tokenize import sent_tokenize
+import nltk
+
+# Download required NLTK data
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt')
 
 class DeepSeekClient:
     """DeepSeek API client for free R1 model"""
@@ -51,7 +59,6 @@ class DeepSeekClient:
         try:
             response = requests.post(url, headers=self.headers, json=payload, timeout=30)
             
-            # Print response for debugging
             print(f"OpenRouter API Response Status: {response.status_code}")
             print(f"OpenRouter API Response: {response.text}")
             
@@ -70,37 +77,33 @@ class PDFRAGBackend:
     """
     PDF RAG System Backend API
     - Upload PDF and ask questions via REST API
-    - Smart chunking and embedding
+    - Smart chunking and TF-IDF based search
     - Student-friendly explanations
     """
 
     def __init__(self):
-        self.embedding_model = None
+        self.vectorizer = TfidfVectorizer(max_features=5000)
         self.deepseek_client = None
         self.chunks = []
-        self.embeddings = []
+        self.chunk_vectors = None
         self.pdf_loaded = False
         self.pdf_name = ""
         self.pdf_path = ""
         self.session_id = str(uuid.uuid4())
 
-        self._initialize_models()
+        self._initialize()
 
-    def _initialize_models(self):
-        """Initialize models"""
-        print("🚀 Loading AI models...")
+    def _initialize(self):
+        """Initialize components"""
+        print("🚀 Initializing PDF RAG System...")
 
         try:
-            # Load embedding model (free and local)
-            self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-            print("✅ Embedding model loaded!")
-
             # Initialize DeepSeek client
             self.deepseek_client = DeepSeekClient()
             print("✅ DeepSeek API ready!")
 
         except Exception as e:
-            print(f"❌ Error loading models: {str(e)}")
+            print(f"❌ Error initializing system: {str(e)}")
             raise
 
     def process_pdf(self, pdf_path: str) -> Dict[str, Any]:
@@ -120,11 +123,9 @@ class PDFRAGBackend:
             # Create chunks
             self.chunks = self._create_chunks(text)
 
-            # Generate embeddings
-            self.embeddings = []
-            for chunk in self.chunks:
-                embedding = self.embedding_model.encode(chunk['text'])
-                self.embeddings.append(embedding)
+            # Generate TF-IDF vectors
+            chunk_texts = [chunk['text'] for chunk in self.chunks]
+            self.chunk_vectors = self.vectorizer.fit_transform(chunk_texts)
 
             self.pdf_loaded = True
             self.pdf_name = os.path.basename(pdf_path)
@@ -156,7 +157,7 @@ class PDFRAGBackend:
         return text
 
     def _create_chunks(self, text: str) -> List[Dict]:
-        """Create smart text chunks"""
+        """Create smart text chunks using sentence tokenization"""
         # Clean text
         text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)
         text = re.sub(r'\s+', ' ', text)
@@ -172,17 +173,17 @@ class PDFRAGBackend:
             if not page_content.strip():
                 continue
 
-            # Split page into paragraphs
-            paragraphs = re.split(r'\n\s*\n', page_content)
+            # Split into sentences
+            sentences = sent_tokenize(page_content)
             current_chunk = ""
 
-            for para in paragraphs:
-                para = para.strip()
-                if not para:
+            for sentence in sentences:
+                sentence = sentence.strip()
+                if not sentence:
                     continue
 
-                # If adding paragraph exceeds chunk size, save current chunk
-                if len(current_chunk + para) > chunk_size and current_chunk:
+                # If adding sentence exceeds chunk size, save current chunk
+                if len(current_chunk + sentence) > chunk_size and current_chunk:
                     chunks.append({
                         'text': current_chunk.strip(),
                         'page': page_num,
@@ -190,16 +191,11 @@ class PDFRAGBackend:
                     })
 
                     # Start new chunk with overlap
-                    words = current_chunk.split()
-                    if len(words) > 20:
-                        overlap_text = ' '.join(words[-20:])
-                        current_chunk = overlap_text + " " + para
-                    else:
-                        current_chunk = para
+                    current_chunk = sentence
                 else:
-                    current_chunk += "\n\n" + para if current_chunk else para
+                    current_chunk += " " + sentence if current_chunk else sentence
 
-            # Add remaining content
+            # Add the last chunk if it exists
             if current_chunk.strip():
                 chunks.append({
                     'text': current_chunk.strip(),
@@ -210,32 +206,21 @@ class PDFRAGBackend:
         return chunks
 
     def find_relevant_chunks(self, question: str, top_k: int = 5) -> List[Tuple[Dict, float]]:
-        """Find most relevant chunks for the question"""
-        if not self.chunks or not self.embeddings:
+        """Find most relevant chunks using TF-IDF similarity"""
+        if not self.chunks or self.chunk_vectors is None:
             return []
 
-        # Get question embedding
-        question_embedding = self.embedding_model.encode(question)
+        # Get question vector
+        question_vector = self.vectorizer.transform([question])
 
         # Calculate similarities
-        similarities = []
-        for i, chunk_embedding in enumerate(self.embeddings):
-            similarity = np.dot(question_embedding, chunk_embedding) / (
-                np.linalg.norm(question_embedding) * np.linalg.norm(chunk_embedding)
-            )
-
-            # Boost similarity if question keywords appear in chunk
-            question_words = set(question.lower().split())
-            chunk_words = set(self.chunks[i]['text'].lower().split())
-            keyword_overlap = len(question_words.intersection(chunk_words))
-            keyword_boost = min(keyword_overlap * 0.02, 0.1)  # Max 0.1 boost
-
-            final_similarity = similarity + keyword_boost
-            similarities.append((self.chunks[i], final_similarity))
+        similarities = np.dot(self.chunk_vectors, question_vector.T).toarray().flatten()
 
         # Sort by similarity and return top results
-        similarities.sort(key=lambda x: x[1], reverse=True)
-        return similarities[:top_k]
+        chunk_scores = list(zip(self.chunks, similarities))
+        chunk_scores.sort(key=lambda x: x[1], reverse=True)
+        
+        return chunk_scores[:top_k]
 
     def ask_question(self, question: str) -> Dict[str, Any]:
         """Ask a question about the PDF and return structured response"""
